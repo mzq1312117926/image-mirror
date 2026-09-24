@@ -1,7 +1,5 @@
-# workflow 名称
 name: image-mirror
 
-# 当新建 issues 时，触发
 on:
   issues:
     types:
@@ -9,156 +7,637 @@ on:
       - reopened
       - edited
 
-
-# 需要执行的任务列表
 jobs:
-  # 镜像转换任务
   sync_to_target_registry:
-    # 运行环境
     runs-on: ubuntu-22.04
-    # 运行条件 => issues 的 label 包含 image-mirror
-    # if: contains(github.event.issue.labels.*.name, 'image-mirror')
     concurrency:
-      group: ${{ github.workflow }}-${{ github.actor }}
-      cancel-in-progress: true
-    # 镜像转换任务的步骤列表
+      group: ${{ github.workflow }}-${{ github.actor }}-${{ github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
+    
     steps:
-
       - name: Check out code
-        uses: actions/checkout@v2
-      # - uses: hmarr/debug-action@v2
-      #   name: debug
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+
+      - name: Prepare image source
+        id: image_source
+        run: |
+          echo "source=issue" >> "$GITHUB_OUTPUT"
+          echo "${{ github.event.issue.body }}" > issue_body.txt
 
       - name: Check issue body for image format
         id: check_body
         run: |
-          python .github/scripts/check_image_format.py "${{ github.event.issue.body }}"
+          python .github/scripts/check_image_format.py "$(cat issue_body.txt)"
 
       - name: Add comment if body is not image format
         if: steps.check_body.outputs.is_image_format == 'false'
-        uses: peter-evans/create-or-update-comment@v2
+        uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ github.event.issue.number }}
           body: |
             @${{ github.event.issue.user.login }} 
-            !!!请使用标准镜像格式
-            1. 镜像要带tag,如nginx,请写为nginx:latest
-            2. 标题不重要,issue描述部分,每行一个镜像不要有其他内容,你可以直接更新你的issue
-          reactions: hooray
+            ⚠️ 请使用标准镜像格式
+            1. 镜像要带 tag，如 nginx，请写为 nginx:latest
+            2. issue 描述部分，每行一个镜像，不要有其他内容
+            3. 你可以直接编辑更新你的 issue
+            4. 同步后会自动为每个架构生成带后缀的镜像，如 nginx:1.27_amd64, nginx:1.27_arm64
+          reactions: eyes
           edit-mode: replace
 
-      - name: Add image-mirror label if body is image format
+      - name: Update issue title with image summary
         if: steps.check_body.outputs.is_image_format == 'true'
-        uses: actions-ecosystem/action-add-labels@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          labels: 'image-mirror'
-
-      - name: Create comment
-        if: ${{ steps.check_body.outputs.is_image_format == 'true' && steps.fc.outputs.comment-id == '' }}
-        uses: peter-evans/create-or-update-comment@v2
-        with:
-          issue-number: ${{ github.event.issue.number }}
-          body: |
-            Syncing image to TargetRegistry, please wait a moment  
-            [Check the progress](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})    
-          reactions: rocket
-
-      - name: prepare
-        if: steps.check_body.outputs.is_image_format == 'true'
-        run: |
-          wget -q  https://github.com/AliyunContainerService/image-syncer/releases/download/v1.5.4/image-syncer-v1.5.4-linux-amd64.tar.gz
-          tar zxf image-syncer-v1.5.4-linux-amd64.tar.gz 
-          sudo  apt install dos2unix 
-      - name: start sync
-        if: steps.check_body.outputs.is_image_format == 'true'
-        id: syncImage
-        env:
-          TARGET_REGISTRY_PASSWORD: ${{ secrets.TARGET_REGISTRY_PASSWORD }}
-          TARGET_REGISTRY_USER: ${{ vars.TARGET_REGISTRY_USER }}
-          # TARGET_REGISTRY: index.docker.io
-          # TARGET_REGISTRY: registry.cn-hangzhou.aliyuncs.com
-          TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
-          TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
-        #处理body中的空格和tab和换行，并在结尾添加: ， 写入images.yml 文件
-        run: | 
-          echo "${{ github.event.issue.body }}" > images-init.yml 
-          dos2unix              images-init.yml
-          sed -i 's/^[ \t]*//g' images-init.yml
-          sed -i 's/[ \t]*$//g' images-init.yml
-          sed -i '/^[  ]*$/d'   images-init.yml
-          img=$(cat images-init.yml)
-          for i in ${img[@]}
-          do
-            tagName=$(echo $i | awk -F "/" '{print $NF}');
-            echo $i: ${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${tagName} >> images.yml;
-            echo ${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${tagName} >> dockerhub-image.yml;
-          done
-          cat images.yml
-          ./image-syncer  --auth=./auth.yml --images=./images.yml 
-      - name: Add Success Issues
-        if: ${{ success() && steps.check_body.outputs.is_image_format == 'true' }} 
-        uses: actions/github-script@v5
+        uses: actions/github-script@v7
         with:
           script: |
-            github.rest.issues.addLabels({
-              issue_number: context.issue.number,
+            const issue_number = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const body = context.payload.issue.body;
+
+            const lines = body.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+            const images = lines.slice(1);
+
+            const top3 = images.slice(0, 3).join(' | ');
+            const total = images.length;
+
+            const newTitle = `${top3} (共 ${total} 个镜像)`;
+
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number,
+              title: newTitle
+            });
+
+      - name: Add image-mirror label
+        if: steps.check_body.outputs.is_image_format == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addLabels({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              labels: ['succeed']
-            })
+              issue_number: context.issue.number,
+              labels: ['image-mirror']
+            });
 
-      - id: get-comment-body
-        if: steps.check_body.outputs.is_image_format == 'true' 
-        run: |
-          body="$(cat script.md)"
-          body="${body//'%'/'%25'}"
-          body="${body//$'\n'/'%0A'}"
-          body="${body//$'\r'/'%0D'}" 
-          echo "::set-output name=body::$body"
-
-          dockerhubImage="$(cat dockerhub-image.yml)"
-          dockerhubImage="${dockerhubImage//'%'/'%25'}"
-          dockerhubImage="${dockerhubImage//$'\n'/'%0A'}"
-          dockerhubImage="${dockerhubImage//$'\r'/'%0D'}" 
-          echo "::set-output name=dockerhubImage::$dockerhubImage"
-
-          sourceImage="$(cat images-init.yml)"
-          sourceImage="${sourceImage//'%'/'%25'}"
-          sourceImage="${sourceImage//$'\n'/'%0A'}"
-          sourceImage="${sourceImage//$'\r'/'%0D'}" 
-          echo "::set-output name=sourceImage::$sourceImage"
-
-      - name: Find Comment
-        if: steps.check_body.outputs.is_image_format == 'true'      
-        uses: peter-evans/find-comment@v2
+      - name: Find existing comment
+        if: steps.check_body.outputs.is_image_format == 'true'
+        uses: peter-evans/find-comment@v3
         id: fc
         with:
           issue-number: ${{ github.event.issue.number }}
           comment-author: 'github-actions[bot]'
-          body-includes: Syncing image to TargetRegistry
+          body-includes: '镜像同步'
 
-      - name: Add Tips
-        if: ${{ success() && steps.check_body.outputs.is_image_format == 'true'  }} 
-        uses: peter-evans/create-or-update-comment@v2
+      - name: Create initial comment
+        if: steps.check_body.outputs.is_image_format == 'true' && steps.fc.outputs.comment-id == ''
+        uses: peter-evans/create-or-update-comment@v4
+        id: create_comment
         with:
-          comment-id: ${{ steps.fc.outputs.comment-id }}
           issue-number: ${{ github.event.issue.number }}
           body: |
-            [Check the progress](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})              
-            ## 镜像信息如下
-            - dockerhub-image.yml  
-            ```shell
-            ${{ steps.get-comment-body.outputs.dockerhubImage }}
+            🚀 开始同步镜像到目标仓库，请稍候...
+            [查看进度](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})
+          reactions: rocket
+
+      - name: Install Skopeo and jq
+        if: steps.check_body.outputs.is_image_format == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Prepare and inspect images
+        if: steps.check_body.outputs.is_image_format == 'true'
+        id: prepare
+        env:
+          TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
+          TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
+        run: |
+          cat issue_body.txt > images-raw.txt
+          
+          # 清理文件
+          sed -e 's/^[ \t]*//g' \
+              -e 's/[ \t]*$//g' \
+              -e '/^[[:space:]]*$/d' \
+              images-raw.txt | tail -n +2 > images-clean.txt
+          
+          > sync-plan.txt
+          > pull-commands.txt
+          > skipped-images.txt
+          
+          echo "=== 检查镜像支持的架构 ==="
+          
+          total_tasks=0
+          skipped_count=0
+          
+          while IFS= read -r source_image; do
+            echo ""
+            echo "📦 检查镜像: $source_image"
+            
+            # 检查是否为 digest 格式
+            if echo "$source_image" | grep -q "@sha256:"; then
+              echo "  ℹ️  检测到 digest 格式镜像"
+              is_digest=true
+              digest_value=$(echo "$source_image" | grep -oE "sha256:[a-f0-9]{64}")
+              base_image_name=$(echo "$source_image" | sed 's/@sha256:.*//')
+            else
+              is_digest=false
+            fi
+            
+            # 使用 skopeo inspect 获取镜像信息
+            if ! raw_manifest=$(skopeo inspect --raw "docker://$source_image" 2>&1); then
+              echo "  ⚠️  无法获取镜像信息，跳过"
+              
+              # 记录跳过的镜像和原因
+              error_msg=$(echo "$raw_manifest" | head -n 1)
+              echo "${source_image}|${error_msg}" >> skipped-images.txt
+              skipped_count=$((skipped_count + 1))
+              continue
+            fi
+            
+            # 保存 manifest 到临时文件
+            echo "$raw_manifest" > /tmp/manifest.json
+            
+            # 判断是否为 manifest list (多架构)
+            media_type=$(echo "$raw_manifest" | jq -r '.mediaType // ""')
+            
+            # 检查是否为 manifest list
+            is_manifest_list=false
+            if [[ "$media_type" == "application/vnd.docker.distribution.manifest.list.v2+json" ]] || \
+               [[ "$media_type" == "application/vnd.oci.image.index.v1+json" ]] || \
+               echo "$raw_manifest" | jq -e '.manifests' >/dev/null 2>&1; then
+              is_manifest_list=true
+            fi
+            
+            if [ "$is_manifest_list" = true ]; then
+              # 多架构镜像
+              echo "  ℹ️  多架构镜像，支持以下架构:"
+              
+              manifests_count=$(echo "$raw_manifest" | jq '.manifests | length')
+              
+              for ((i=0; i<manifests_count; i++)); do
+                arch=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.architecture // \"\"")
+                variant=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.variant // \"\"")
+                os=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.os // \"linux\"")
+                
+                ref_type=$(echo "$raw_manifest" | jq -r ".manifests[$i].annotations.\"vnd.docker.reference.type\" // \"\"")
+                if [ "$ref_type" = "attestation-manifest" ]; then
+                  continue
+                fi
+                
+                if [ "$arch" = "unknown" ] || [ -z "$arch" ] || [ "$arch" = "null" ]; then
+                  continue
+                fi
+                
+                if [ "$os" != "linux" ] || [ "$os" = "unknown" ]; then
+                  continue
+                fi
+                
+                if [ "$variant" = "null" ] || [ -z "$variant" ]; then
+                  variant=""
+                fi
+                
+                if [ -n "$variant" ]; then
+                  arch_suffix="${arch}_${variant}"
+                else
+                  arch_suffix="${arch}"
+                fi
+                
+                case "$arch_suffix" in
+                  amd64*|x86_64*) arch_suffix="amd64" ;;
+                  arm64*|aarch64*) arch_suffix="arm64" ;;
+                  arm_v8) arch_suffix="arm64" ;;
+                  arm_v7|armv7*) arch_suffix="arm_v7" ;;
+                  arm_v6|armv6*) arch_suffix="arm_v6" ;;
+                  arm_v5|armv5*) arch_suffix="arm_v5" ;;
+                  ppc64le*) arch_suffix="ppc64le" ;;
+                  s390x*) arch_suffix="s390x" ;;
+                  386*|i386*) arch_suffix="386" ;;
+                  riscv64*) arch_suffix="riscv64" ;;
+                esac
+                
+                echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
+                
+                if [ "$is_digest" = true ]; then
+                  short_digest=$(echo "$digest_value" | cut -d: -f2 | cut -c1-12)
+                  tag_name=$(echo "$base_image_name" | awk -F "/" '{print $NF}')
+                  target_tag="${tag_name}:${short_digest}_${arch_suffix}"
+                else
+                  tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
+                  base_tag=$(echo "$tag_name" | cut -d: -f1)
+                  version_tag=$(echo "$tag_name" | cut -d: -f2-)
+                  target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+                fi
+                
+                target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
+                
+                echo "${source_image}|${arch}|${variant}|${target_image}" >> sync-plan.txt
+                echo "docker pull $target_image" >> pull-commands.txt
+                
+                total_tasks=$((total_tasks + 1))
+              done
+              
+            else
+              # 单架构镜像
+              echo "  ℹ️  单架构镜像"
+              
+              arch=$(echo "$raw_manifest" | jq -r '.architecture // empty')
+              
+              if [ -z "$arch" ] || [ "$arch" = "null" ]; then
+                if detail_info=$(skopeo inspect "docker://$source_image" 2>/dev/null); then
+                  arch=$(echo "$detail_info" | jq -r '.Architecture // "amd64"')
+                  variant=$(echo "$detail_info" | jq -r '.Variant // ""')
+                else
+                  arch="amd64"
+                  variant=""
+                fi
+              else
+                variant=$(echo "$raw_manifest" | jq -r '.variant // ""')
+              fi
+              
+              if [ "$variant" = "null" ] || [ -z "$variant" ]; then
+                variant=""
+              fi
+              
+              if [ -n "$variant" ]; then
+                arch_suffix="${arch}_${variant}"
+              else
+                arch_suffix="${arch}"
+              fi
+              
+              case "$arch_suffix" in
+                amd64*|x86_64*) arch_suffix="amd64" ;;
+                arm64*|aarch64*) arch_suffix="arm64" ;;
+                arm_v8) arch_suffix="arm64" ;;
+                arm_v7|armv7*) arch_suffix="arm_v7" ;;
+                arm_v6|armv6*) arch_suffix="arm_v6" ;;
+                arm_v5|armv5*) arch_suffix="arm_v5" ;;
+                ppc64le*) arch_suffix="ppc64le" ;;
+                s390x*) arch_suffix="s390x" ;;
+                386*|i386*) arch_suffix="386" ;;
+                riscv64*) arch_suffix="riscv64" ;;
+              esac
+              
+              echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
+              
+              if [ "$is_digest" = true ]; then
+                short_digest=$(echo "$digest_value" | cut -d: -f2 | cut -c1-12)
+                tag_name=$(echo "$base_image_name" | awk -F "/" '{print $NF}')
+                target_tag="${tag_name}:${short_digest}_${arch_suffix}"
+              else
+                tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
+                base_tag=$(echo "$tag_name" | cut -d: -f1)
+                version_tag=$(echo "$tag_name" | cut -d: -f2-)
+                target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+              fi
+              
+              target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
+              
+              echo "${source_image}|${arch}|${variant}|${target_image}" >> sync-plan.txt
+              echo "docker pull $target_image" >> pull-commands.txt
+              
+              total_tasks=$((total_tasks + 1))
+            fi
+            
+          done < images-clean.txt
+          
+          sort -u sync-plan.txt -o sync-plan.txt
+          sort -u pull-commands.txt -o pull-commands.txt
+          
+          source_image_count=$(wc -l < images-clean.txt)
+          total_tasks=$(wc -l < sync-plan.txt)
+          
+          echo ""
+          echo "=== 同步计划 ==="
+          echo "源镜像数: $source_image_count"
+          echo "同步任务数: $total_tasks"
+          echo "跳过镜像数: $skipped_count"
+          
+          if [ "$skipped_count" -gt 0 ]; then
+            echo ""
+            echo "=== 跳过的镜像 ==="
+            cat skipped-images.txt
+          fi
+          
+          echo "image_count=$source_image_count" >> "$GITHUB_OUTPUT"
+          echo "task_count=$total_tasks" >> "$GITHUB_OUTPUT"
+          echo "skipped_count=$skipped_count" >> "$GITHUB_OUTPUT"
+          echo "registry=${TARGET_REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "namespace=${TARGET_NAMESPACE}" >> "$GITHUB_OUTPUT"
+          
+          if [ "$total_tasks" -eq 0 ] && [ "$skipped_count" -eq 0 ]; then
+            echo "⚠️  没有可同步的镜像"
+            exit 1
+          fi
+
+      - name: Sync images with Skopeo
+        if: steps.check_body.outputs.is_image_format == 'true'
+        id: sync
+        env:
+          TARGET_REGISTRY_PASSWORD: ${{ secrets.TARGET_REGISTRY_PASSWORD }}
+          TARGET_REGISTRY_USER: ${{ vars.TARGET_REGISTRY_USER }}
+          TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
+          TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
+        run: |
+          if [ -n "$TARGET_REGISTRY_USER" ] && [ -n "$TARGET_REGISTRY_PASSWORD" ]; then
+            echo "🔐 登录目标仓库..."
+            skopeo login "$TARGET_REGISTRY" \
+              --username "$TARGET_REGISTRY_USER" \
+              --password "$TARGET_REGISTRY_PASSWORD"
+          fi
+          
+          > sync-success.txt
+          > sync-failed.txt
+          > sync-details.txt
+          
+          total=$(wc -l < sync-plan.txt)
+          current=0
+          
+          echo "=== 开始同步镜像 ==="
+          
+          while IFS='|' read -r source_image arch variant target_image; do
+            current=$((current + 1))
+            
+            arch_display="${arch}${variant:+/$variant}"
+            
+            echo ""
+            echo "[$current/$total] 同步: $source_image"
+            echo "         架构: $arch_display"
+            echo "         -> $target_image"
+            
+            success=false
+            sync_method=""
+            
+            # 构建 skopeo 命令
+            skopeo_cmd=(skopeo copy
+              --override-arch "$arch"
+              --override-os linux
+            )
+            
+            # 如果有 variant，添加参数
+            if [ -n "$variant" ] && [ "$variant" != "null" ]; then
+              skopeo_cmd+=(--override-variant "$variant")
+            fi
+            
+            # 策略 1: 尝试 OCI 格式
+            echo "  尝试: OCI 格式"
+            "${skopeo_cmd[@]}" \
+              --format oci \
+              --retry-times 2 \
+              "docker://$source_image" \
+              "docker://$target_image" 2>&1 | tee /tmp/skopeo_oci.log
+            
+            if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+              echo "  ✅ 成功 (OCI)"
+              sync_method="OCI"
+              success=true
+            fi
+            
+            # 策略 2: 如果失败，尝试 v2s2 格式
+            if [ "$success" = false ]; then
+              echo "  ⚠️  OCI 失败，尝试: v2s2 格式"
+              "${skopeo_cmd[@]}" \
+                --format v2s2 \
+                --retry-times 2 \
+                "docker://$source_image" \
+                "docker://$target_image" 2>&1 | tee /tmp/skopeo_v2s2.log
+              
+              if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+                echo "  ✅ 成功 (v2s2)"
+                sync_method="v2s2"
+                success=true
+              fi
+            fi
+            
+            # 记录结果
+            if [ "$success" = true ]; then
+              echo "$target_image" >> sync-success.txt
+              echo "✅ $source_image ($arch_display) → $target_image" >> sync-details.txt
+            else
+              echo "$source_image ($arch_display) -> $target_image" >> sync-failed.txt
+              echo "❌ $source_image ($arch_display) → 同步失败" >> sync-details.txt
+            fi
+            
+          done < sync-plan.txt
+          
+          success_count=$(wc -l < sync-success.txt 2>/dev/null || echo 0)
+          failed_count=$(wc -l < sync-failed.txt 2>/dev/null || echo 0)
+          
+          echo "success_count=$success_count" >> "$GITHUB_OUTPUT"
+          echo "failed_count=$failed_count" >> "$GITHUB_OUTPUT"
+          
+          echo ""
+          echo "=== 同步结果 ==="
+          echo "✅ 成功: $success_count"
+          echo "❌ 失败: $failed_count"
+          
+          # 只要有一个成功，就不退出失败
+          if [ "$success_count" -eq 0 ]; then
+            echo ""
+            echo "⚠️  所有镜像同步失败"
+            exit 1
+          else
+            echo ""
+            echo "✅ 至少有 $success_count 个镜像同步成功"
+            if [ "$failed_count" -gt 0 ]; then
+              echo ""
+              echo "=== 失败列表 ==="
+              cat sync-failed.txt
+            fi
+          fi
+
+      - name: Prepare comment body
+        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.prepare.outcome != 'skipped'
+        id: comment_body
+        run: |
+          TIMESTAMP=$(date +%s%N)
+          
+          if [ -f sync-success.txt ] && [ -s sync-success.txt ]; then
+            {
+              echo "success_images<<EOF_SUCCESS_${TIMESTAMP}"
+              cat sync-success.txt
+              echo "EOF_SUCCESS_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "success_images=" >> "$GITHUB_OUTPUT"
+          fi
+          
+          if [ -f sync-failed.txt ] && [ -s sync-failed.txt ]; then
+            {
+              echo "failed_images<<EOF_FAILED_${TIMESTAMP}"
+              cat sync-failed.txt
+              echo "EOF_FAILED_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "failed_images=" >> "$GITHUB_OUTPUT"
+          fi
+          
+          if [ -f sync-details.txt ] && [ -s sync-details.txt ]; then
+            {
+              echo "sync_details<<EOF_DETAILS_${TIMESTAMP}"
+              cat sync-details.txt
+              echo "EOF_DETAILS_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "sync_details=" >> "$GITHUB_OUTPUT"
+          fi
+          
+          # 跳过的镜像
+          if [ -f skipped-images.txt ] && [ -s skipped-images.txt ]; then
+            {
+              echo "skipped_images<<EOF_SKIPPED_${TIMESTAMP}"
+              while IFS='|' read -r image error; do
+                echo "- $image"
+                echo "  原因: $error"
+              done < skipped-images.txt
+              echo "EOF_SKIPPED_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "skipped_images=" >> "$GITHUB_OUTPUT"
+          fi
+          
+          if [ -f sync-success.txt ] && [ -s sync-success.txt ]; then
+            > pull-commands-success.txt
+            while IFS= read -r target_image; do
+              echo "docker pull $target_image" >> pull-commands-success.txt
+            done < sync-success.txt
+            
+            {
+              echo "pull_commands<<EOF_PULL_${TIMESTAMP}"
+              cat pull-commands-success.txt
+              echo "EOF_PULL_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "pull_commands=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine final status
+        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.sync.outcome != 'skipped'
+        id: final_status
+        run: |
+          success_count=${{ steps.sync.outputs.success_count || 0 }}
+          failed_count=${{ steps.sync.outputs.failed_count || 0 }}
+          
+          if [ "$success_count" -gt 0 ]; then
+            if [ "$failed_count" -eq 0 ]; then
+              echo "status=full_success" >> "$GITHUB_OUTPUT"
+              echo "label=succeed" >> "$GITHUB_OUTPUT"
+              echo "emoji=✅" >> "$GITHUB_OUTPUT"
+            else
+              echo "status=partial_success" >> "$GITHUB_OUTPUT"
+              echo "label=partial-succeed" >> "$GITHUB_OUTPUT"
+              echo "emoji=⚠️" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "label=failed" >> "$GITHUB_OUTPUT"
+            echo "emoji=❌" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Add status label
+        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.sync.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = '${{ steps.final_status.outputs.label }}';
+            
+            // 移除旧标签
+            const labelsToRemove = ['succeed', 'partial-succeed', 'failed'];
+            for (const oldLabel of labelsToRemove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name: oldLabel
+                });
+              } catch (error) {
+                // 标签不存在，忽略错误
+              }
+            }
+            
+            // 添加新标签
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [label]
+            });
+
+      - name: Update comment with results
+        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.prepare.outcome != 'skipped'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id || steps.create_comment.outputs.comment-id }}
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            ${{ steps.sync.outcome == 'skipped' && '⏭️' || steps.final_status.outputs.emoji }} **镜像同步${{ steps.sync.outcome == 'skipped' && '准备阶段' || (steps.final_status.outputs.status == 'full_success' && '完全成功' || (steps.final_status.outputs.status == 'partial_success' && '部分成功' || '失败')) }}！**
+            
+            [查看详情](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            ## 📋 同步统计
+            - 源镜像数: ${{ steps.prepare.outputs.image_count }}
+            - 同步任务数: ${{ steps.prepare.outputs.task_count }}
+            ${{ steps.prepare.outputs.skipped_count > 0 && format('- ⏭️ 跳过: {0}', steps.prepare.outputs.skipped_count) || '' }}
+            ${{ steps.sync.outcome != 'skipped' && format('- ✅ 成功: {0}', steps.sync.outputs.success_count || 0) || '' }}
+            ${{ steps.sync.outcome != 'skipped' && format('- ❌ 失败: {0}', steps.sync.outputs.failed_count || 0) || '' }}
+            - 🏠 目标仓库: `${{ steps.prepare.outputs.registry }}`
+            - 📦 命名空间: `${{ steps.prepare.outputs.namespace }}`
+            
+            > 💡 **说明**: 每个源镜像会根据其支持的架构，同步为多个带架构后缀的目标镜像（如 `nginx:1.27_amd64`, `nginx:1.27_arm64`）
+            
+            ${{ steps.prepare.outputs.skipped_count > 0 && format('## ⏭️ 跳过的镜像
+            
+            以下镜像无法获取信息，已跳过：
+            
             ```
-            - images-init.yml
-            ```shell
-            ${{ steps.get-comment-body.outputs.sourceImage }}
-            ```            
-            ${{ steps.get-comment-body.outputs.body }}
-          reactions: hooray
+            {0}
+            ```
+            
+            **常见原因：**
+            - 镜像不存在或已被删除
+            - 源仓库访问受限（需要认证或地区限制）
+            - 镜像名称或标签错误
+            - 网络问题或源仓库不可用
+            
+            **建议：**
+            - 检查镜像名称和标签是否正确
+            - 尝试访问源仓库确认镜像是否存在
+            - 使用 `skopeo inspect docker://<镜像名>` 手动测试
+            ', steps.comment_body.outputs.skipped_images) || '' }}
+            
+            ${{ steps.sync.outcome != 'skipped' && steps.sync.outputs.success_count > 0 && format('## 🚀 Pull 命令 (成功的镜像)
+            ```bash
+            {0}
+            ```', steps.comment_body.outputs.pull_commands) || '' }}
+            
+            ${{ steps.sync.outcome != 'skipped' && format('## 📊 详细结果
+            ```
+            {0}
+            ```', steps.comment_body.outputs.sync_details) || '' }}
+            
+            ${{ steps.sync.outcome != 'skipped' && steps.sync.outputs.failed_count > 0 && format('## ❌ 失败的镜像
+            
+            以下镜像同步失败：
+            
+            ```
+            {0}
+            ```
+            
+            **可能的原因：**
+            - 源镜像不支持该架构
+            - 网络问题或源仓库限流
+            - 镜像格式不兼容
+            - 目标仓库空间不足或权限问题
+            
+            **建议：** 
+            - 使用 `skopeo inspect --raw docker://<镜像名>` 检查源镜像支持的架构
+            - 可以尝试重新编辑 issue 触发再次同步', steps.comment_body.outputs.failed_images) || '' }}
+          reactions: ${{ steps.sync.outcome == 'skipped' && 'eyes' || (steps.final_status.outputs.status == 'full_success' && 'hooray' || (steps.final_status.outputs.status == 'partial_success' && 'eyes' || 'confused')) }}
           edit-mode: replace
